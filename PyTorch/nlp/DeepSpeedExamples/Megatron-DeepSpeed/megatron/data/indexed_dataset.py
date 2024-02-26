@@ -10,6 +10,9 @@
 # Added document index to index file and made it accessible.
 #    An empty sentence no longer separates documents.
 
+# Some of the fixes/improvements are adopted from
+# https://github.com/bigscience-workshop/Megatron-DeepSpeed/blob/main/megatron/data/indexed_dataset.py
+
 from functools import lru_cache
 import os
 import shutil
@@ -95,9 +98,9 @@ dtypes = {
     3: np.int16,
     4: np.int32,
     5: np.int64,
-    6: np.float32,
-    7: np.float64,
-    8: np.uint16
+    6: np.float64,
+    7: np.float32,
+    8: np.uint16,
 }
 
 
@@ -269,7 +272,7 @@ class IndexedDatasetBuilder(object):
         np.int32: 4,
         np.int64: 8,
         np.float32: 4,
-        np.float64: 8
+        np.float64: 8,
     }
 
     def __init__(self, out_file, dtype=np.int32):
@@ -295,13 +298,18 @@ class IndexedDatasetBuilder(object):
         index = IndexedDataset(another_file)
         assert index.dtype == self.dtype
 
+        doc_offset = len(self.sizes)
+
         begin = self.data_offsets[-1]
-        for offset in index.data_offsets[1:]:
-            self.data_offsets.append(begin + offset)
+        for data_offset in index.data_offsets[1:]:
+            self.data_offsets.append(begin + data_offset)
         self.sizes.extend(index.sizes)
+
         begin = self.dim_offsets[-1]
         for dim_offset in index.dim_offsets[1:]:
             self.dim_offsets.append(begin + dim_offset)
+
+        self.doc_idx.extend((doc_offset + index.doc_idx)[1:])
 
         with open(data_file_path(another_file), 'rb') as f:
             while True:
@@ -332,6 +340,38 @@ def _warmup_mmap_file(path):
             pass
 
 
+def exscan_from_cumsum_(arr):
+    # given an array holding the result of an inclusive scan (cumsum),
+    # convert to an exclusive scan (shift to the right)
+    # [10, 30, 35, 50] --> [0, 10, 30, 35]
+    if arr.size > 1:
+        arr[1:] = arr[:-1]
+    if arr.size > 0:
+        arr[0] = 0
+
+
+def get_pointers_with_total(sizes, elemsize, dtype):
+    """Return a numpy array of type np.dtype giving the byte offsets.
+
+    Multiplies values in the sizes array by elemsize (bytes),
+    and then computes an exclusive scan to get byte offsets.
+    Returns the total number of bytes as second item in a tuple.
+    """
+
+    # scale values in sizes array by elemsize to get sizes in bytes
+    pointers = np.array(sizes, dtype=dtype)
+    pointers *= elemsize
+    np.cumsum(pointers, axis=0, out=pointers)
+
+    # get total number of bytes from all sizes (last element)
+    bytes_last = pointers[-1] if len(sizes) > 0 else 0
+
+    # convert to byte offsets
+    exscan_from_cumsum_(pointers)
+
+    return pointers, bytes_last
+
+
 class MMapIndexedDataset(torch.utils.data.Dataset):
     class Index(object):
         _HDR_MAGIC = b'MMIDIDX\x00\x00'
@@ -349,28 +389,27 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
                     return self
 
                 @staticmethod
-                def _get_pointers(sizes):
-                    dtype_size = dtype().itemsize
-                    address = 0
-                    pointers = []
+                def _get_pointers(sizes, npdtype):
+                    """Return a numpy array of byte offsets given a list of sizes.
 
-                    for size in sizes:
-                        pointers.append(address)
-                        address += size * dtype_size
+                    Multiplies values in the sizes array by dtype size (bytes),
+                    and then computes an exclusive scan to get byte offsets.
+                    """
 
+                    # compute element sizes in bytes
+                    pointers, _ = get_pointers_with_total(sizes, dtype().itemsize, npdtype)
                     return pointers
 
                 def write(self, sizes, doc_idx):
-                    pointers = self._get_pointers(sizes)
-
                     self._file.write(struct.pack('<Q', len(sizes)))
                     self._file.write(struct.pack('<Q', len(doc_idx)))
 
-                    sizes = np.array(sizes, dtype=np.int32)
-                    self._file.write(sizes.tobytes(order='C'))
-                    del sizes
+                    sizes32 = np.array(sizes, dtype=np.int32)
+                    self._file.write(sizes32.tobytes(order='C'))
+                    del sizes32
 
-                    pointers = np.array(pointers, dtype=np.int64)
+                    pointers = self._get_pointers(sizes, np.int64)
+                    del sizes
                     self._file.write(pointers.tobytes(order='C'))
                     del pointers
 
@@ -455,7 +494,7 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
         return self._path
 
     def __setstate__(self, state):
-        self._do_init(state)
+        self._do_init(state, skip_warmup=True)
 
     def _do_init(self, path, skip_warmup):
         self._path = path
@@ -479,7 +518,7 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
 
     # @lru_cache(maxsize=8)
     def __getitem__(self, idx):
-        if isinstance(idx, int):
+        if isinstance(idx, (int, np.integer)):
             ptr, size = self._index[idx]
             np_array = np.frombuffer(self._bin_buffer, dtype=self._index.dtype,
                                      count=size, offset=ptr)
@@ -496,6 +535,8 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
                                      count=total_size, offset=ptr)
             sents = np.split(np_array, offsets[:-1])
             return sents
+        else:
+            raise TypeError("Unexpected type received for idx: {}".format(type(idx)))
 
     def get(self, idx, offset=0, length=None):
         """ Retrieves a single item from the dataset with the option to only
@@ -514,6 +555,9 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
     @property
     def sizes(self):
         return self._index.sizes
+
+    def size(self, index):
+        return self._index.sizes[index]
 
     @property
     def doc_idx(self):
@@ -535,6 +579,10 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
             os.path.exists(index_file_path(path)) and os.path.exists(data_file_path(path))
         )
 
+    @property
+    def dtype(self):
+        return self._index.dtype
+
 
 class MMapIndexedDatasetBuilder(object):
     def __init__(self, out_file, dtype=np.int64):
@@ -548,6 +596,12 @@ class MMapIndexedDatasetBuilder(object):
         self._data_file.write(np_array.tobytes(order='C'))
         self._sizes.append(np_array.size)
 
+    def add_doc(self, tensor, sizes):
+        np_array = np.array(tensor, dtype=self._dtype)
+        self._data_file.write(np_array.tobytes(order='C'))
+        self._sizes.extend(sizes)
+        self._doc_idx.append(len(self._sizes))
+
     def end_document(self):
         self._doc_idx.append(len(self._sizes))
 
@@ -556,8 +610,9 @@ class MMapIndexedDatasetBuilder(object):
         index = MMapIndexedDataset.Index(index_file_path(another_file))
         assert index.dtype == self._dtype
 
-        for size in index.sizes:
-            self._sizes.append(size)
+        offset = len(self._sizes)
+        self._sizes.extend(index.sizes)
+        self._doc_idx.extend((offset + index.doc_idx)[1:])
 
         # Concatenate data
         with open(data_file_path(another_file), 'rb') as f:
