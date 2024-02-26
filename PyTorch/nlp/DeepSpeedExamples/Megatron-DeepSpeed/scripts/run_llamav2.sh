@@ -49,6 +49,7 @@ USE_FUSED_SDPA_WITH_RECOMPUTE=${HL_USE_FUSED_SDPA_WITH_RECOMPUTE:-false}
 DROPOUT=${HL_DROPOUT:-0.1}
 USE_TORCH_COMPILE=${HL_USE_TORCH_COMPILE:-false}
 NO_PIPELINE_PARALLEL=${HL_NO_PIPELINE_PARALLEL:-0}
+DATA_TOKENIZER_TYPE=${HL_DATA_TOKENIZER_TYPE:-} # GPT2BPETokenizer(default) or Llama2Tokenizer.
 # ----------------------
 
 if [[ -z "$MODEL_REFERENCES_ROOT" ]]; then
@@ -149,6 +150,17 @@ if [ "$NUM_NODES" -ne "1" -a -f "$HOSTSFILE" ]; then
                    --master_addr $(head -n 1 $HOSTSFILE | sed -n s/[[:space:]]slots.*//p) "
 fi
 
+# dataset
+DATA_ARGS="--data-path ${DATA_PATH}"
+if [ -z "${DATA_TOKENIZER_TYPE}" ]; then
+    DATA_ARGS="${DATA_ARGS} --vocab-file $DATA_DIR/gpt2-vocab.json --merge-file $DATA_DIR/gpt2-merges.txt"
+elif [ "${DATA_TOKENIZER_TYPE}" == "Llama2Tokenizer" ]; then
+    DATA_ARGS="${DATA_ARGS} --tokenizer-type ${DATA_TOKENIZER_TYPE} --tokenizer-model-file ${DATA_DIR}/tokenizer.model"
+else
+    echo "Unsupported tokenizer type ${DATA_TOKENIZER_TYPE}"
+    exit 1
+fi
+
 # training script command
 CMD=""
 if [ ! -z "$QNPU_DIR" ]; then
@@ -178,9 +190,7 @@ CMD="${CMD} \
     --log-interval ${LOG_INTERVAL} \
     --eval-iters 100 \
     --eval-interval 1000 \
-    --data-path ${DATA_PATH} \
-    --vocab-file $DATA_DIR/gpt2-vocab.json \
-    --merge-file $DATA_DIR/gpt2-merges.txt \
+    ${DATA_ARGS} \
     --optimizer ${OPTIMIZER} \
     --adam-beta1 0.9 \
     --adam-beta2 0.95 \
