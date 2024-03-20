@@ -331,14 +331,13 @@ mkdir -p ${TENSORBOARD_DIR}
 CHECKPOINT_PATH="${OUTPUT_BASEPATH}/checkpoint/${NAME}"
 
 ### Dataset
-VOCAB_PATH=${DIR}/dataset/oscar-en-10k/gpt2-vocab.json
-MERGE_PATH=${DIR}/dataset/oscar-en-10k/gpt2-merges.txt
-DATA_BLEND=${DIR}/dataset/oscar-en-10k/meg-gpt2_text_document
+DATA_BLEND=${DIR}/dataset/oscar-en-10k-llama2/meg-llama2_text_document
+TOKENIZER_MODEL=${DIR}/dataset/oscar-en-10k-llama2/tokenizer.model
 ###############################################################################
 data_options=" \
-         --vocab-file ${VOCAB_PATH} \
-         --merge-file ${MERGE_PATH} \
          --data-path ${DATA_BLEND} \
+         --tokenizer-model-file  ${TOKENIZER_MODEL} \
+         --tokenizer-type Llama2Tokenizer \
          --data-impl mmap"
 
 if [ "$USE_HPU" == "true" ]; then
